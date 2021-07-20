@@ -24,6 +24,7 @@
 #endif
 #include <errno.h>
 #include <netinet/in.h>
+#include <netinet/udp.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <sys/socket.h>
@@ -51,56 +52,21 @@ struct st_h2o_http3_ingress_unistream_t {
                          const uint8_t *src_end, int is_eos);
 };
 
-const ptls_iovec_t h2o_http3_alpn[2] = {{(void *)H2O_STRLIT("h3-29")}, {(void *)H2O_STRLIT("h3-27")}};
+const ptls_iovec_t h2o_http3_alpn[3] = {{(void *)H2O_STRLIT("h3")}, {(void *)H2O_STRLIT("h3-29")}, {(void *)H2O_STRLIT("h3-27")}};
 
-static void on_track_sendmsg_timer(h2o_timer_t *timeout);
-
-static struct {
-    /**
-     * counts number of successful invocations of `sendmsg` since the process was launched
-     */
-    uint64_t total_successes;
-    /**
-     * struct that retains information since previous log emission. Needs locked access using `locked.mutex`.
-     */
-    struct {
-        pthread_mutex_t mutex;
-        uint64_t prev_successes;
-        uint64_t cur_failures;
-        int last_errno;
-        h2o_timer_t timer;
-    } locked;
-} track_sendmsg = {.locked = {PTHREAD_MUTEX_INITIALIZER, .timer = {.cb = on_track_sendmsg_timer}}};
-
-void on_track_sendmsg_timer(h2o_timer_t *timeout)
+static void report_sendmsg_errors(h2o_error_reporter_t *reporter, uint64_t total_successes, uint64_t cur_successes)
 {
     char errstr[256];
-
-    pthread_mutex_lock(&track_sendmsg.locked.mutex);
-
-    uint64_t total_successes = __sync_fetch_and_add(&track_sendmsg.total_successes, 0),
-             cur_successes = total_successes - track_sendmsg.locked.prev_successes;
-
     fprintf(stderr, "sendmsg failed %" PRIu64 " time%s, succeeded: %" PRIu64 " time%s, over the last minute: %s\n",
-            track_sendmsg.locked.cur_failures, track_sendmsg.locked.cur_failures > 1 ? "s" : "", cur_successes,
-            cur_successes > 1 ? "s" : "", h2o_strerror_r(track_sendmsg.locked.last_errno, errstr, sizeof(errstr)));
-
-    track_sendmsg.locked.prev_successes = total_successes;
-    track_sendmsg.locked.cur_failures = 0;
-    track_sendmsg.locked.last_errno = 0;
-
-    pthread_mutex_unlock(&track_sendmsg.locked.mutex);
+            reporter->cur_errors, reporter->cur_errors > 1 ? "s" : "", cur_successes, cur_successes > 1 ? "s" : "",
+            h2o_strerror_r((int)reporter->data, errstr, sizeof(errstr)));
 }
 
-/**
- * Sends a packet, returns if the connection is still maintainable (false is returned when not being able to send a packet from the
- * designated source address).
- */
+static h2o_error_reporter_t track_sendmsg = H2O_ERROR_REPORTER_INITIALIZER(report_sendmsg_errors);
+
 int h2o_quic_send_datagrams(h2o_quic_ctx_t *ctx, quicly_address_t *dest, quicly_address_t *src, struct iovec *datagrams,
                             size_t num_datagrams)
 {
-    int ret;
-    struct msghdr mess;
     union {
         struct cmsghdr hdr;
         char buf[
@@ -113,35 +79,38 @@ int h2o_quic_send_datagrams(h2o_quic_ctx_t *ctx, quicly_address_t *dest, quicly_
 #else
             CMSG_SPACE(1)
 #endif
+            +
+#ifdef UDP_SEGMENT
+            CMSG_SPACE(sizeof(uint16_t))
+#else
+            0
+#endif
         ];
-    } cmsg;
+    } cmsgbuf = {.buf = {}};
+    struct cmsghdr *cmsg = &cmsgbuf.hdr;
 
-    /* prepare the fields that remain constant across multiple datagrams */
-    memset(&mess, 0, sizeof(mess));
-    mess.msg_name = &dest->sa;
-    mess.msg_namelen = quicly_get_socklen(&dest->sa);
+    /* first CMSG is the source address */
     if (src->sa.sa_family != AF_UNSPEC) {
         size_t cmsg_bodylen = 0;
-        memset(&cmsg, 0, sizeof(cmsg));
         switch (src->sa.sa_family) {
         case AF_INET: {
 #if defined(IP_PKTINFO)
             if (*ctx->sock.port != src->sin.sin_port)
                 return 0;
-            cmsg.hdr.cmsg_level = IPPROTO_IP;
-            cmsg.hdr.cmsg_type = IP_PKTINFO;
+            cmsg->cmsg_level = IPPROTO_IP;
+            cmsg->cmsg_type = IP_PKTINFO;
             cmsg_bodylen = sizeof(struct in_pktinfo);
-            ((struct in_pktinfo *)CMSG_DATA(&cmsg.hdr))->ipi_spec_dst = src->sin.sin_addr;
+            memcpy(&((struct in_pktinfo *)CMSG_DATA(cmsg))->ipi_spec_dst, &src->sin.sin_addr, sizeof(struct in_addr));
 #elif defined(IP_SENDSRCADDR)
             if (*ctx->sock.port != src->sin.sin_port)
                 return 0;
             struct sockaddr_in *fdaddr = (struct sockaddr_in *)&ctx->sock.addr;
             assert(fdaddr->sin_family == AF_INET);
             if (fdaddr->sin_addr.s_addr == INADDR_ANY) {
-                cmsg.hdr.cmsg_level = IPPROTO_IP;
-                cmsg.hdr.cmsg_type = IP_SENDSRCADDR;
+                cmsg->cmsg_level = IPPROTO_IP;
+                cmsg->cmsg_type = IP_SENDSRCADDR;
                 cmsg_bodylen = sizeof(struct in_addr);
-                *(struct in_addr *)CMSG_DATA(&cmsg.hdr) = src->sin.sin_addr;
+                memcpy(CMSG_DATA(cmsg), &src->sin.sin_addr, sizeof(struct in_addr));
             }
 #else
             h2o_fatal("IP_PKTINFO not available");
@@ -151,10 +120,10 @@ int h2o_quic_send_datagrams(h2o_quic_ctx_t *ctx, quicly_address_t *dest, quicly_
 #ifdef IPV6_PKTINFO
             if (*ctx->sock.port != src->sin6.sin6_port)
                 return 0;
-            cmsg.hdr.cmsg_level = IPPROTO_IPV6;
-            cmsg.hdr.cmsg_type = IPV6_PKTINFO;
+            cmsg->cmsg_level = IPPROTO_IPV6;
+            cmsg->cmsg_type = IPV6_PKTINFO;
             cmsg_bodylen = sizeof(struct in6_pktinfo);
-            ((struct in6_pktinfo *)CMSG_DATA(&cmsg.hdr))->ipi6_addr = src->sin6.sin6_addr;
+            memcpy(&((struct in6_pktinfo *)CMSG_DATA(cmsg))->ipi6_addr, &src->sin6.sin6_addr, sizeof(struct in6_addr));
 #else
             h2o_fatal("IPV6_PKTINFO not available");
 #endif
@@ -163,12 +132,42 @@ int h2o_quic_send_datagrams(h2o_quic_ctx_t *ctx, quicly_address_t *dest, quicly_
             h2o_fatal("unexpected address family");
             break;
         }
-        mess.msg_control = &cmsg;
-        cmsg.hdr.cmsg_len = (socklen_t)CMSG_LEN(cmsg_bodylen);
-        mess.msg_controllen = (socklen_t)CMSG_SPACE(cmsg_bodylen);
+        cmsg->cmsg_len = (socklen_t)CMSG_LEN(cmsg_bodylen);
+        cmsg = (struct cmsghdr *)((char *)cmsg + CMSG_SPACE(cmsg_bodylen));
     }
 
+    /* next CMSG is UDP_SEGMENT size (for GSO) */
+#ifdef UDP_SEGMENT
+    if (num_datagrams > 1) {
+        for (size_t i = 1; i < num_datagrams - 1; ++i)
+            assert(datagrams[i].iov_len == datagrams[0].iov_len);
+        uint16_t segsize = (uint16_t)datagrams[0].iov_len;
+        cmsg->cmsg_level = SOL_UDP;
+        cmsg->cmsg_type = UDP_SEGMENT;
+        cmsg->cmsg_len = CMSG_LEN(sizeof(segsize));
+        memcpy(CMSG_DATA(cmsg), &segsize, sizeof(segsize));
+        cmsg = (struct cmsghdr *)((char *)cmsg + CMSG_SPACE(sizeof(segsize)));
+    }
+#endif
+
     /* send datagrams */
+    struct msghdr mess = {
+        .msg_name = &dest->sa,
+        .msg_namelen = quicly_get_socklen(&dest->sa),
+    };
+    if (cmsg != &cmsgbuf.hdr) {
+        mess.msg_control = &cmsgbuf.buf;
+        mess.msg_controllen = (socklen_t)((char *)cmsg - cmsgbuf.buf);
+    }
+    int ret;
+#ifdef UDP_SEGMENT
+    mess.msg_iov = datagrams;
+    mess.msg_iovlen = num_datagrams;
+    while ((ret = (int)sendmsg(h2o_socket_get_fd(ctx->sock.sock), &mess, 0)) == -1 && errno == EINTR)
+        ;
+    if (ret == -1)
+        goto SendmsgError;
+#else
     for (size_t i = 0; i < num_datagrams; ++i) {
         mess.msg_iov = datagrams + i;
         mess.msg_iovlen = 1;
@@ -177,7 +176,9 @@ int h2o_quic_send_datagrams(h2o_quic_ctx_t *ctx, quicly_address_t *dest, quicly_
         if (ret == -1)
             goto SendmsgError;
     }
-    __sync_fetch_and_add(&track_sendmsg.total_successes, 1);
+#endif
+
+    h2o_error_reporter_record_success(&track_sendmsg);
 
     return 1;
 
@@ -191,12 +192,7 @@ SendmsgError:
      * specific?) */
 
     /* Log the number of failed invocations once per minute, if there has been such a failure. */
-    pthread_mutex_lock(&track_sendmsg.locked.mutex);
-    ++track_sendmsg.locked.cur_failures;
-    track_sendmsg.locked.last_errno = errno;
-    if (!h2o_timer_is_linked(&track_sendmsg.locked.timer))
-        h2o_timer_link(ctx->loop, 60000, &track_sendmsg.locked.timer);
-    pthread_mutex_unlock(&track_sendmsg.locked.mutex);
+    h2o_error_reporter_record_error(ctx->loop, &track_sendmsg, 60000, errno);
 
     return 1;
 }
@@ -615,13 +611,14 @@ static void process_packets(h2o_quic_ctx_t *ctx, quicly_address_t *destaddr, qui
                     if ((conn = ctx->acceptor(ctx, destaddr, srcaddr, packets + i)) != NULL) {
                         /* non-null generally means success, except for H2O_QUIC_ACCEPT_CONN_DECRYPTION_FAILED */
                         if (conn == (h2o_quic_conn_t *)H2O_QUIC_ACCEPT_CONN_DECRYPTION_FAILED) {
-                            /* failed to decrypt Initial packet <=> it could belong to a connection on a different node
-                             * forward it to the right destination */
+                            /* failed to decrypt Initial packet <=> it could belong to a connection on a different node; forward it
+                             * to the destination being claimed by the DCID */
                             uint64_t offending_node_id = packets[i].cid.dest.plaintext.node_id;
-                            conn = NULL;
-                            if (ctx->forward_packets != NULL && ttl > 0)
-                                ctx->forward_packets(ctx, &offending_node_id, packets[i].cid.dest.plaintext.thread_id, destaddr,
-                                                     srcaddr, ttl, packets, num_packets);
+                            uint32_t offending_thread_id = packets[i].cid.dest.plaintext.thread_id;
+                            if (ctx->forward_packets != NULL && ttl > 0 &&
+                                (offending_node_id != ctx->next_cid.node_id || offending_thread_id != ctx->next_cid.thread_id))
+                                ctx->forward_packets(ctx, &offending_node_id, offending_thread_id, destaddr, srcaddr, ttl, packets,
+                                                     num_packets);
                             return;
                         }
                         break;
@@ -663,9 +660,16 @@ static void process_packets(h2o_quic_ctx_t *ctx, quicly_address_t *destaddr, qui
         size_t i;
     Receive:
         for (i = 0; i != num_packets; ++i) {
-            /* FIXME process errors? */
-            if (i != accepted_packet_index)
-                quicly_receive(conn->quic, &destaddr->sa, &srcaddr->sa, packets + i);
+            if (i != accepted_packet_index) {
+                int ret = quicly_receive(conn->quic, &destaddr->sa, &srcaddr->sa, packets + i);
+                switch (ret) {
+                case QUICLY_ERROR_STATE_EXHAUSTION:
+                case PTLS_ERROR_NO_MEMORY:
+                    fprintf(stderr, "%s: `quicly_receive()` returned ret:%d\n", __func__, ret);
+                    conn->callbacks->destroy_connection(conn);
+                    return;
+                }
+            }
         }
     }
 
@@ -1003,12 +1007,15 @@ void h2o_quic_close_all_connections(h2o_quic_ctx_t *ctx)
     h2o_quic_conn_t *conn;
 
     kh_foreach_value(ctx->conns_by_id, conn, { h2o_quic_close_connection(conn, 0, NULL); });
-    kh_foreach_value(ctx->conns_accepting, conn, { h2o_quic_close_connection(conn, 0, NULL); });
+    /* closing a connection should also remove an entry from conns_accepting */
+    assert(kh_size(ctx->conns_accepting) == 0);
 }
 
 size_t h2o_quic_num_connections(h2o_quic_ctx_t *ctx)
 {
-    return kh_size(ctx->conns_by_id) + kh_size(ctx->conns_accepting);
+    /* throughout its lifetime, a connection is always registered to both conns_by_id and conns_accepting,
+       thus counting conns_by_id is enough */
+    return kh_size(ctx->conns_by_id);
 }
 
 void h2o_quic_init_conn(h2o_quic_conn_t *conn, h2o_quic_ctx_t *ctx, const h2o_quic_conn_callbacks_t *callbacks)
@@ -1116,6 +1123,7 @@ int h2o_quic_send(h2o_quic_conn_t *conn)
                 break;
             }
             break;
+        case QUICLY_ERROR_STATE_EXHAUSTION:
         case QUICLY_ERROR_FREE_CONNECTION:
             conn->callbacks->destroy_connection(conn);
             return 0;
